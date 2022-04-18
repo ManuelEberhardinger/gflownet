@@ -7,6 +7,8 @@ import os
 import pickle
 from collections import defaultdict
 from itertools import count
+from matplotlib import pyplot as plt
+from matplotlib.animation import FuncAnimation
 
 import numpy as np
 from scipy.stats import norm
@@ -33,7 +35,7 @@ parser.add_argument("--mbsize", default=16, help="Minibatch size", type=int)
 parser.add_argument("--train_to_sample_ratio", default=1, type=float)
 parser.add_argument("--n_hid", default=256, type=int)
 parser.add_argument("--n_layers", default=2, type=int)
-parser.add_argument("--n_train_steps", default=20000, type=int)
+parser.add_argument("--n_train_steps", default=100, type=int)
 parser.add_argument("--num_empirical_loss", default=200000, type=int,
                     help="Number of samples used to compute the empirical distribution loss")
 # Env
@@ -46,13 +48,13 @@ parser.add_argument("--bufsize", default=16, help="MCMC buffer size", type=int)
 
 # Flownet
 parser.add_argument("--bootstrap_tau", default=0., type=float)
-parser.add_argument("--replay_strategy", default='none', type=str) # top_k none
+parser.add_argument("--replay_strategy", default='none', type=str)  # top_k none
 parser.add_argument("--replay_sample_size", default=2, type=int)
 parser.add_argument("--replay_buf_size", default=100, type=float)
 
 # PPO
-parser.add_argument("--ppo_num_epochs", default=32, type=int) # number of SGD steps per epoch
-parser.add_argument("--ppo_epoch_size", default=16, type=int) # number of sampled minibatches per epoch
+parser.add_argument("--ppo_num_epochs", default=32, type=int)  # number of SGD steps per epoch
+parser.add_argument("--ppo_epoch_size", default=16, type=int)  # number of sampled minibatches per epoch
 parser.add_argument("--ppo_clip", default=0.2, type=float)
 parser.add_argument("--ppo_entropy_coef", default=1e-1, type=float)
 parser.add_argument("--clip_grad_norm", default=0., type=float)
@@ -61,11 +63,10 @@ parser.add_argument("--clip_grad_norm", default=0., type=float)
 parser.add_argument("--sac_alpha", default=0.98*np.log(1/3), type=float)
 
 
-
-
 _dev = [torch.device('cpu')]
-tf = lambda x: torch.FloatTensor(x).to(_dev[0])
-tl = lambda x: torch.LongTensor(x).to(_dev[0])
+def tf(x): return torch.FloatTensor(x).to(_dev[0])
+def tl(x): return torch.LongTensor(x).to(_dev[0])
+
 
 def set_device(dev):
     _dev[0] = dev
@@ -75,17 +76,21 @@ def func_corners(x):
     ax = abs(x)
     return (ax > 0.5).prod(-1) * 0.5 + ((ax < 0.8) * (ax > 0.6)).prod(-1) * 2 + 1e-1
 
+
 def func_corners_floor_B(x):
     ax = abs(x)
     return (ax > 0.5).prod(-1) * 0.5 + ((ax < 0.8) * (ax > 0.6)).prod(-1) * 2 + 1e-2
+
 
 def func_corners_floor_A(x):
     ax = abs(x)
     return (ax > 0.5).prod(-1) * 0.5 + ((ax < 0.8) * (ax > 0.6)).prod(-1) * 2 + 1e-3
 
+
 def func_cos_N(x):
     ax = abs(x)
     return ((np.cos(x * 50) + 1) * norm.pdf(x * 5)).prod(-1) + 0.01
+
 
 class GridEnv:
 
@@ -99,9 +104,10 @@ class GridEnv:
             if func is None else func)
         self.xspace = np.linspace(*xrange, horizon)
         self.allow_backward = allow_backward  # If true then this is a
-                                              # MCMC ergodic env,
-                                              # otherwise a DAG
+        # MCMC ergodic env,
+        # otherwise a DAG
         self._true_density = None
+        self.state_history = []
 
     def obs(self, s=None):
         s = np.int32(self._state if s is None else s)
@@ -126,16 +132,26 @@ class GridEnv:
             if s[i] > 0:
                 sp = s + 0
                 sp[i] -= 1
-                if sp.max() == self.horizon-1: # can't have a terminal parent
+                if sp.max() == self.horizon-1:  # can't have a terminal parent
                     continue
                 parents += [self.obs(sp)]
                 actions += [i]
         return parents, actions
 
+    def get_index_from_state(self, s):
+        a = s.reshape((self.ndim, self.horizon))
+        idx = np.where(a == 1)[-1]
+        return idx
+
     def step(self, a, s=None):
+        step = None
         if self.allow_backward:
-            return self.step_chain(a, s)
-        return self.step_dag(a, s)
+            step = self.step_chain(a, s)
+        else:
+            step = self.step_dag(a, s)
+        idx = self.get_index_from_state(step[0])
+        self.state_history.append(idx)
+        return step
 
     def step_dag(self, a, s=None):
         _s = s
@@ -156,7 +172,7 @@ class GridEnv:
         if a < self.ndim:
             s[a] = min(s[a]+1, self.horizon-1)
         if a >= self.ndim:
-            s[a-self.ndim] = max(s[a-self.ndim]-1,0)
+            s[a-self.ndim] = max(s[a-self.ndim]-1, 0)
 
         reverse_a = ((a + self.ndim) % (2 * self.ndim)) if any(sc != s) else a
 
@@ -175,9 +191,18 @@ class GridEnv:
                   (self.xspace[-1] - self.xspace[0]) + self.xspace[0])
         traj_rewards = self.func(all_xs)[state_mask]
         self._true_density = (traj_rewards / traj_rewards.sum(),
-                              list(map(tuple,all_int_states[state_mask])),
+                              list(map(tuple, all_int_states[state_mask])),
                               traj_rewards)
         return self._true_density
+
+    def reward_for_plotting(self):
+        all_int_states = np.int32(list(itertools.product(*[list(range(self.horizon))]*self.ndim)))
+        all_xs = (np.float32(all_int_states) / (self.horizon-1) *
+                  (self.xspace[-1] - self.xspace[0]) + self.xspace[0])
+        traj_rewards = self.func(all_xs)
+        traj_rewards = traj_rewards / traj_rewards.sum()
+        grid = traj_rewards.reshape([self.horizon for _ in range(self.ndim)])
+        return grid
 
     def all_possible_states(self):
         """Compute quantities for debugging and analysis"""
@@ -186,7 +211,8 @@ class GridEnv:
             s = s + 0
             s[a] += 1
             return s
-        f = lambda a, s: (
+
+        def f(a, s): return (
             [np.int32(a)] if np.max(s) == self.horizon - 1 else
             [np.int32(a+[self.ndim])]+sum([f(a+[i], step_fast(i, s)) for i in range(self.ndim)], []))
         all_act_seqs = f([], np.zeros(self.ndim, dtype='int32'))
@@ -196,8 +222,8 @@ class GridEnv:
         # the corresponding states are. Here we can just count how
         # many times we moved in each dimension:
         all_traj_states = np.int32([np.bincount(i[:j], minlength=self.ndim+1)[:-1]
-                                   for i in all_act_seqs
-                                   for j in range(len(i))])
+                                    for i in all_act_seqs
+                                    for j in range(len(i))])
         # all_int_states is ordered, so we can map a trajectory to its
         # index via a sum
         arr_mult = np.int32([self.horizon**(self.ndim-i-1)
@@ -206,7 +232,7 @@ class GridEnv:
             all_traj_states * arr_mult[None, :]
         ).sum(1)
         # For each partial trajectory, we want the index of which trajectory it belongs to
-        all_traj_idxs = [[j]*len(i) for j,i in enumerate(all_act_seqs)]
+        all_traj_idxs = [[j]*len(i) for j, i in enumerate(all_act_seqs)]
         # For each partial trajectory, we want the index of which state it leads to
         all_traj_s_idxs = [(np.bincount(i, minlength=self.ndim+1)[:-1] * arr_mult).sum()
                            for i in all_act_seqs]
@@ -217,12 +243,13 @@ class GridEnv:
         v2 = torch.LongTensor(all_traj_s_idxs)
         # With all this we can do an index_add, given
         # pi(all_int_states):
+
         def compute_all_probs(policy_for_all_states):
             """computes p(x) given pi(a|s) for all s"""
             dev = policy_for_all_states.device
             pi_a_s = torch.log(policy_for_all_states[u, a])
             q = torch.exp(torch.zeros(len(all_act_seqs), device=dev)
-                                      .index_add_(0, v1, pi_a_s))
+                          .index_add_(0, v1, pi_a_s))
             q_sum = (torch.zeros((all_xs.shape[0],), device=dev)
                      .index_add_(0, v2, q))
             return q_sum[state_mask]
@@ -236,6 +263,7 @@ class GridEnv:
         all_int_obs = np.float32([self.obs(i) for i in all_int_states])
         print(all_int_obs.shape, a.shape, u.shape, v1.shape, v2.shape)
         return all_int_obs, traj_rewards, all_xs, compute_all_probs
+
 
 def make_mlp(l, act=nn.LeakyReLU(), tail=[]):
     """makes an MLP with no top layer activation"""
@@ -289,6 +317,7 @@ class ReplayBuffer:
             r = 0
         return traj
 
+
 class FlowNetAgent:
     def __init__(self, args, envs):
         self.model = make_mlp([args.horizon * args.ndim] +
@@ -313,13 +342,13 @@ class FlowNetAgent:
             # Note to self: this is ugly, ugly code
             with torch.no_grad():
                 acts = Categorical(logits=self.model(s)).sample()
-            step = [i.step(a) for i,a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
+            step = [i.step(a) for i, a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
             p_a = [self.envs[0].parent_transitions(sp_state, a == self.ndim)
                    for a, (sp, r, done, sp_state) in zip(acts, step)]
             batch += [[tf(i) for i in (p, a, [r], [sp], [d])]
                       for (p, a), (sp, r, d, _) in zip(p_a, step)]
             c = count(0)
-            m = {j:next(c) for j in range(mbsize) if not done[j]}
+            m = {j: next(c) for j in range(mbsize) if not done[j]}
             done = [bool(d or step[m[i]][2]) for i, d in enumerate(done)]
             s = tf([i[0] for i in step if not i[2]])
             for (_, r, d, sp) in step:
@@ -328,16 +357,16 @@ class FlowNetAgent:
                     self.replay.add(tuple(sp), r)
         return batch
 
-
     def learn_from(self, it, batch):
         loginf = tf([1000])
-        batch_idxs = tl(sum([[i]*len(parents) for i, (parents,_,_,_,_) in enumerate(batch)], []))
+        batch_idxs = tl(sum([[i]*len(parents) for i, (parents, _, _, _, _) in enumerate(batch)], []))
         parents, actions, r, sp, done = map(torch.cat, zip(*batch))
         parents_Qsa = self.model(parents)[torch.arange(parents.shape[0]), actions.long()]
         in_flow = torch.log(torch.zeros((sp.shape[0],))
                             .index_add_(0, batch_idxs, torch.exp(parents_Qsa)))
         if self.tau > 0:
-            with torch.no_grad(): next_q = self.target(sp)
+            with torch.no_grad():
+                next_q = self.target(sp)
         else:
             next_q = self.model(sp)
         next_qd = next_q * (1-done).unsqueeze(1) + done.unsqueeze(1) * (-loginf)
@@ -349,7 +378,7 @@ class FlowNetAgent:
             flow_loss = ((in_flow - out_flow) * (1-done)).pow(2).sum() / ((1-done).sum() + 1e-20)
 
         if self.tau > 0:
-            for a,b in zip(self.model.parameters(), self.target.parameters()):
+            for a, b in zip(self.model.parameters(), self.target.parameters()):
                 b.data.mul_(1-self.tau).add_(self.tau*a)
 
         return loss, term_loss, flow_loss
@@ -370,12 +399,12 @@ class SplitCategorical:
     def log_prob(self, a):
         split = a < self.n
         log_one_half = -0.693147
-        return (log_one_half + # We need to multiply the prob by 0.5, so add log(0.5) to logprob
+        return (log_one_half +  # We need to multiply the prob by 0.5, so add log(0.5) to logprob
                 self.cats[0].log_prob(torch.minimum(a, torch.tensor(self.n-1))) * split +
                 self.cats[1].log_prob(torch.maximum(a - self.n, torch.tensor(0))) * (~split))
 
     def entropy(self):
-        return Categorical(probs=torch.cat([self.cats[0].probs, self.cats[1].probs],-1) * 0.5).entropy()
+        return Categorical(probs=torch.cat([self.cats[0].probs, self.cats[1].probs], -1) * 0.5).entropy()
 
 
 class MARSAgent:
@@ -388,7 +417,7 @@ class MARSAgent:
         self.dataset_max = args.n_dataset_pts
         self.mbsize = args.mbsize
         self.envs = envs
-        self.batch = [i.reset() for i in envs] # The N MCMC chains
+        self.batch = [i.reset() for i in envs]  # The N MCMC chains
         self.ndim = args.ndim
         self.bufsize = args.bufsize
 
@@ -398,19 +427,21 @@ class MARSAgent:
     def sample_many(self, mbsize, all_visited):
         s = torch.cat([tf([i[0]]) for i in self.batch])
         r = torch.cat([tf([i[1]]) for i in self.batch])
-        with torch.no_grad(): logits = self.model(s)
+        with torch.no_grad():
+            logits = self.model(s)
         pi = SplitCategorical(self.ndim, logits=logits)
         a = pi.sample()
         q_xpx = torch.exp(pi.log_prob(a))
         steps = [self.envs[j].step(a[j].item(), s=self.batch[j][2]) for j in range(len(self.envs))]
         sp = torch.cat([tf([i[0]]) for i in steps])
         rp = torch.cat([tf([i[1]]) for i in steps])
-        with torch.no_grad(): logits_sp = self.model(sp)
+        with torch.no_grad():
+            logits_sp = self.model(sp)
         reverse_a = tl([i[3] for i in steps])
         pi_sp = SplitCategorical(self.ndim, logits=logits_sp)
         q_xxp = torch.exp(pi.log_prob(reverse_a))
         # This is the correct MH acceptance ratio:
-        #A = (rp * q_xxp) / (r * q_xpx + 1e-6)
+        # A = (rp * q_xxp) / (r * q_xpx + 1e-6)
 
         # But the paper suggests to use this ratio, for reasons poorly
         # explained... it does seem to actually work better? but still
@@ -418,14 +449,13 @@ class MARSAgent:
         A = rp / r
         U = torch.rand(self.bufsize)
         for j in range(self.bufsize):
-            if A[j] > U[j]: # Accept
+            if A[j] > U[j]:  # Accept
                 self.batch[j] = (sp[j].numpy(), rp[j].item(), steps[j][2])
                 all_visited.append(tuple(steps[j][2]))
             # Added `or U[j] < 0.05` for stability in these toy settings
-            if rp[j] > r[j] or U[j] < 0.05: # Add to dataset
+            if rp[j] > r[j] or U[j] < 0.05:  # Add to dataset
                 self.dataset.append((s[j].unsqueeze(0), a[j].unsqueeze(0)))
-        return [] # agent is stateful, no need to return minibatch data
-
+        return []  # agent is stateful, no need to return minibatch data
 
     def learn_from(self, i, data):
         if not i % 20 and len(self.dataset) > self.dataset_max:
@@ -445,7 +475,7 @@ class MARSAgent:
 class MHAgent:
     def __init__(self, args, envs):
         self.envs = envs
-        self.batch = [i.reset() for i in envs] # The N MCMC chains
+        self.batch = [i.reset() for i in envs]  # The N MCMC chains
         self.bufsize = args.bufsize
         self.nactions = args.ndim*2
         self.model = None
@@ -459,9 +489,9 @@ class MHAgent:
         steps = [self.envs[j].step(a[j], s=self.batch[j][2]) for j in range(self.bufsize)]
         rp = np.float32([i[1] for i in steps])
         A = rp / r
-        U = np.random.uniform(0,1,self.bufsize)
+        U = np.random.uniform(0, 1, self.bufsize)
         for j in range(self.bufsize):
-            if A[j] > U[j]: # Accept
+            if A[j] > U[j]:  # Accept
                 self.batch[j] = (None, rp[j], steps[j][2])
                 all_visited.append(tuple(steps[j][2]))
         return []
@@ -474,7 +504,7 @@ class PPOAgent:
     def __init__(self, args, envs):
         self.model = make_mlp([args.horizon * args.ndim] +
                               [args.n_hid] * args.n_layers +
-                              [args.ndim+1+1]) # +1 for stop action, +1 for V
+                              [args.ndim+1+1])  # +1 for stop action, +1 for V
         self.model.to(args.dev)
         self.envs = envs
         self.mbsize = args.mbsize
@@ -494,12 +524,12 @@ class PPOAgent:
             with torch.no_grad():
                 pol = Categorical(logits=self.model(s)[:, :-1])
                 acts = pol.sample()
-            step = [i.step(a) for i,a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
+            step = [i.step(a) for i, a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
             log_probs = pol.log_prob(acts)
             c = count(0)
-            m = {j:next(c) for j in range(mbsize) if not done[j]}
+            m = {j: next(c) for j in range(mbsize) if not done[j]}
             for si, a, (sp, r, d, _), (traj_idx, _), lp in zip(s, acts, step, sorted(m.items()), log_probs):
-                trajs[traj_idx].append([si[None,:]] + [tf([i]) for i in (a, r, sp, d, lp)])
+                trajs[traj_idx].append([si[None, :]] + [tf([i]) for i in (a, r, sp, d, lp)])
             done = [bool(d or step[m[i]][2]) for i, d in enumerate(done)]
             s = tf([i[0] for i in step if not i[2]])
             for (_, r, d, sp) in step:
@@ -513,7 +543,7 @@ class PPOAgent:
                 vsp = self.model(sp)[:, -1]
             adv = r + vsp * (1-d) - vs
             for i, A in zip(tau, adv):
-                i.append(r[-1].unsqueeze(0)) # The return is always just the last reward, gamma is 1
+                i.append(r[-1].unsqueeze(0))  # The return is always just the last reward, gamma is 1
                 i.append(A.unsqueeze(0))
         return sum(trajs.values(), [])
 
@@ -538,6 +568,7 @@ class PPOAgent:
         return (action_loss + value_loss - entropy * self.entropy_coef,
                 action_loss, value_loss, entropy)
 
+
 class RandomTrajAgent:
     def __init__(self, args, envs):
         self.mbsize = args.mbsize
@@ -555,16 +586,18 @@ class RandomTrajAgent:
         trajs = defaultdict(list)
         while not all(done):
             acts = np.random.randint(0, self.nact, mbsize)
-            step = [i.step(a) for i,a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
+            step = [i.step(a) for i, a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
             c = count(0)
-            m = {j:next(c) for j in range(mbsize) if not done[j]}
+            m = {j: next(c) for j in range(mbsize) if not done[j]}
             done = [bool(d or step[m[i]][2]) for i, d in enumerate(done)]
             for (_, r, d, sp) in step:
-                if d: all_visited.append(tuple(sp))
+                if d:
+                    all_visited.append(tuple(sp))
         return []
 
     def learn_from(self, it, batch):
         return None
+
 
 class SACAgent:
     def __init__(self, args, envs):
@@ -579,11 +612,11 @@ class SACAgent:
                             [args.n_hid] * args.n_layers +
                             [args.ndim+1])
         self.Q_t1 = make_mlp([args.horizon * args.ndim] +
-                            [args.n_hid] * args.n_layers +
-                            [args.ndim+1])
+                             [args.n_hid] * args.n_layers +
+                             [args.ndim+1])
         self.Q_t2 = make_mlp([args.horizon * args.ndim] +
-                            [args.n_hid] * args.n_layers +
-                            [args.ndim+1])
+                             [args.n_hid] * args.n_layers +
+                             [args.ndim+1])
         self.envs = envs
         self.mbsize = args.mbsize
         self.tau = args.bootstrap_tau
@@ -591,7 +624,7 @@ class SACAgent:
         self.alpha_target = args.sac_alpha
 
     def parameters(self):
-        return (list(self.pol.parameters())+list(self.Q_1.parameters())+
+        return (list(self.pol.parameters())+list(self.Q_1.parameters()) +
                 list(self.Q_2.parameters()) + [self.alpha])
 
     def sample_many(self, mbsize, all_visited):
@@ -603,15 +636,16 @@ class SACAgent:
             with torch.no_grad():
                 pol = Categorical(probs=self.pol(s))
                 acts = pol.sample()
-            step = [i.step(a) for i,a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
+            step = [i.step(a) for i, a in zip([e for d, e in zip(done, self.envs) if not d], acts)]
             c = count(0)
-            m = {j:next(c) for j in range(mbsize) if not done[j]}
+            m = {j: next(c) for j in range(mbsize) if not done[j]}
             for si, a, (sp, r, d, _), (traj_idx, _) in zip(s, acts, step, sorted(m.items())):
-                trajs[traj_idx].append([si[None,:]] + [tf([i]) for i in (a, r, sp, d)])
+                trajs[traj_idx].append([si[None, :]] + [tf([i]) for i in (a, r, sp, d)])
             done = [bool(d or step[m[i]][2]) for i, d in enumerate(done)]
             s = tf([i[0] for i in step if not i[2]])
             for (_, r, d, sp) in step:
-                if d: all_visited.append(tuple(sp))
+                if d:
+                    all_visited.append(tuple(sp))
         return sum(trajs.values(), [])
 
     def learn_from(self, it, batch):
@@ -637,10 +671,11 @@ class SACAgent:
 
         if not it % 100:
             print(ps[0].data, ps[-1].data, (ps * torch.log(ps)).sum(1).mean())
-        for A,B in [(self.Q_1, self.Q_t1), (self.Q_2, self.Q_t2)]:
-            for a,b in zip(A.parameters(), B.parameters()):
+        for A, B in [(self.Q_1, self.Q_t1), (self.Q_2, self.Q_t2)]:
+            for a, b in zip(A.parameters(), B.parameters()):
                 b.data.mul_(1-self.tau).add_(self.tau*a)
         return J_Q + J_pi + J_alpha, J_Q, J_pi, J_alpha, self.alpha
+
 
 def make_opt(params, args):
     params = list(params)
@@ -669,22 +704,36 @@ def compute_empirical_distribution_error(env, visited):
     kl = (true_density * torch.log(estimated_density / true_density)).sum().item()
     return k1, kl
 
+
+def create_animation(env, method_name, steps):
+    fig = plt.figure(figsize=(8, 8))
+    truelr_npy = env.reward_for_plotting()
+    img = plt.imshow(truelr_npy)
+    scat = plt.scatter(0, 0, c="black", s=800)
+    states = env.state_history
+
+    def iteration(it):
+        scat.set_offsets(states[it])
+    anim = FuncAnimation(fig, iteration, frames=len(states), interval=1)
+    anim.save(f"animations/{method_name}_{steps}steps_{len(states)}.mp4", extra_args=['-vcodec', 'libx264'])
+
+
 def main(args):
     args.dev = torch.device(args.device)
     set_device(args.dev)
+    print(f"train agent with {args.method} on {args.dev} for {args.n_train_steps} steps")
     f = {'default': None,
          'cos_N': func_cos_N,
          'corners': func_corners,
          'corners_floor_A': func_corners_floor_A,
          'corners_floor_B': func_corners_floor_B,
-    }[args.func]
+         }[args.func]
 
     args.is_mcmc = args.method in ['mars', 'mcmc']
 
     env = GridEnv(args.horizon, args.ndim, func=f, allow_backward=args.is_mcmc)
     envs = [GridEnv(args.horizon, args.ndim, func=f, allow_backward=args.is_mcmc)
             for i in range(args.bufsize)]
-    ndim = args.ndim
 
     if args.method == 'flownet':
         agent = FlowNetAgent(args, envs)
@@ -707,7 +756,7 @@ def main(args):
     empirical_distrib_losses = []
 
     ttsr = max(int(args.train_to_sample_ratio), 1)
-    sttr = max(int(1/args.train_to_sample_ratio), 1) # sample to train ratio
+    sttr = max(int(1/args.train_to_sample_ratio), 1)  # sample to train ratio
 
     if args.method == 'ppo':
         ttsr = args.ppo_num_epochs
@@ -718,7 +767,7 @@ def main(args):
         for j in range(sttr):
             data += agent.sample_many(args.mbsize, all_visited)
         for j in range(ttsr):
-            losses = agent.learn_from(i * ttsr + j, data) # returns (opt loss, *metrics)
+            losses = agent.learn_from(i * ttsr + j, data)  # returns (opt loss, *metrics)
             if losses is not None:
                 losses[0].backward()
                 if args.clip_grad_norm > 0:
@@ -742,13 +791,16 @@ def main(args):
     os.makedirs(root, exist_ok=True)
     pickle.dump(
         {'losses': np.float32(all_losses),
-         #'model': agent.model.to('cpu') if agent.model else None,
+         # 'model': agent.model.to('cpu') if agent.model else None,
          'params': [i.data.to('cpu').numpy() for i in agent.parameters()],
          'visited': np.int8(all_visited),
          'emp_dist_loss': empirical_distrib_losses,
          'true_d': env.true_density()[0],
-         'args':args},
+         'args': args},
         gzip.open(args.save_path, 'wb'))
+
+    create_animation(envs[0], args.method, args.n_train_steps)
+
 
 if __name__ == '__main__':
     args = parser.parse_args()
